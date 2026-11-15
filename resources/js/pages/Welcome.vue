@@ -4,7 +4,7 @@ import { Head } from '@inertiajs/vue3';
 </script>
 
 <template>
-    <Head title="Covenant Interlinear" />
+    <Head title="Covenant of Christ Interlinear" />
     <PublicShell>
         <main
             class="mx-auto flex min-h-[70vh] max-w-3xl items-center px-6 py-16"
