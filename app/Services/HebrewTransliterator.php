@@ -49,7 +49,7 @@ class HebrewTransliterator
                 continue;
             }
 
-            $letter = $match[1];
+            $letter = $match[1] ?? '';
             $marks = $match[2] ?? '';
             $hasDagesh = str_contains($marks, "\u{05BC}");
             $hasShinDot = str_contains($marks, "\u{05C1}");
