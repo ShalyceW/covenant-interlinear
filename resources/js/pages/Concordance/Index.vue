@@ -59,7 +59,10 @@ function submit() {
                             {{ entry.hebrew }}
                         </p>
                         <p class="mt-1 text-sm text-stone-500 italic">
-                            {{ entry.transliteration || 'unresolved' }}
+                            {{
+                                entry.transliteration ||
+                                'Transliteration pending'
+                            }}
                         </p>
                     </div>
                     <div>
@@ -69,6 +72,9 @@ function submit() {
                             class="mt-1 text-xs font-semibold text-amber-800"
                         >
                             {{ entry.strongs_number }}
+                        </p>
+                        <p class="mt-1 text-xs text-stone-500">
+                            {{ entry.match_type.replaceAll('_', ' ') }}
                         </p>
                     </div>
                     <p class="text-sm text-stone-500 sm:text-right">

@@ -61,6 +61,38 @@ test('concordance search and word study count published occurrences', function (
         ->assertJsonPath('lemma.definition', 'Nephi');
 });
 
+test('word study counts every occurrence before paginating the displayed contexts', function () {
+    $chapter = scriptureChapter();
+    $passage = $chapter->passages()->firstOrFail();
+    $lemma = Lemma::query()->firstOrFail();
+    $selected = HebrewWord::query()->where('normalized', 'נפי')->firstOrFail();
+    $selected->update(['enrichment' => ['lemma' => ['status' => 'confirmed', 'source' => 'editorial']]]);
+    foreach (range(3, 302) as $position) {
+        $passage->hebrewWords()->create([
+            'position' => $position,
+            'hebrew' => 'נְפִי',
+            'normalized' => 'נפי',
+            'lemma_id' => $lemma->id,
+            'enrichment' => ['lemma' => ['status' => 'confirmed', 'source' => 'editorial']],
+        ]);
+    }
+
+    $this->getJson("/word-study/{$selected->id}")
+        ->assertOk()
+        ->assertJsonPath('occurrence_count', 301)
+        ->assertJsonPath('pagination.last_page', 7)
+        ->assertJsonCount(50, 'occurrences');
+});
+
+test('tentative lemma links remain exact-form concordance groups', function () {
+    scriptureChapter();
+    $word = HebrewWord::query()->where('normalized', 'נפי')->firstOrFail();
+    $word->update(['enrichment' => ['lemma' => ['status' => 'proposed', 'source' => 'generated']]]);
+
+    $this->get(route('concordance.index', ['q' => 'נפי']))->assertOk()->assertInertia(fn (Assert $page) => $page
+        ->where('results.0.match_type', 'exact_written_form'));
+});
+
 test('print view uses the same passage and gloss data', function () {
     scriptureChapter();
 

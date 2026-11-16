@@ -27,6 +27,9 @@ class HebrewWordInfolist
                 TextEntry::make('morphology')
                     ->placeholder('-')
                     ->columnSpanFull(),
+                TextEntry::make('enrichment')
+                    ->placeholder('-')
+                    ->columnSpanFull(),
                 TextEntry::make('created_at')
                     ->dateTime()
                     ->placeholder('-'),

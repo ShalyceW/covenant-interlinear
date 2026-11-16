@@ -32,6 +32,14 @@ class HebrewWordsTable
                     ->searchable(),
                 TextColumn::make('english_gloss')
                     ->searchable(),
+                TextColumn::make('enrichment.lemma.status')
+                    ->label('Lemma status')
+                    ->badge()
+                    ->toggleable(),
+                TextColumn::make('enrichment.gloss.status')
+                    ->label('Gloss status')
+                    ->badge()
+                    ->toggleable(isToggledHiddenByDefault: true),
                 TextColumn::make('created_at')
                     ->dateTime()
                     ->sortable()
@@ -47,8 +55,9 @@ class HebrewWordsTable
             ])
             ->recordActions([
                 Action::make('lookupLexicon')
-                    ->label('Lookup lexicon')
+                    ->label('Resolve lexicon')
                     ->icon('heroicon-o-book-open')
+                    ->visible(fn (HebrewWord $record): bool => ! $record->hasConfirmedLemma())
                     ->action(function (HebrewWord $record, ScriptureImporter $importer): void {
                         $found = $importer->lookupLexicon($record);
                         Notification::make()

@@ -8,6 +8,7 @@ use App\Models\HebrewWord;
 use App\Models\Lemma;
 use App\Models\Passage;
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -149,7 +150,7 @@ class ScriptureImporter
                 $existingWords = $passage->hebrewWords()->get();
                 $existingForms = $existingWords->pluck('hebrew')->all();
                 $newForms = array_column($tokens, 'hebrew');
-                $hasAnnotations = $existingWords->contains(fn ($word): bool => filled($word->lemma_id) || filled($word->transliteration) || filled($word->english_gloss) || filled($word->morphology)
+                $hasAnnotations = $existingWords->contains(fn ($word): bool => filled($word->lemma_id) || filled($word->transliteration) || filled($word->english_gloss) || filled($word->morphology) || filled($word->enrichment)
                 );
 
                 if ($sourceChanged && $existingWords->isNotEmpty() && $existingForms !== $newForms && $hasAnnotations) {
@@ -230,6 +231,7 @@ class ScriptureImporter
                     'transliteration' => $preserve ? $previous->transliteration : null,
                     'english_gloss' => $preserve ? $previous->english_gloss : null,
                     'morphology' => $preserve ? $previous->morphology : null,
+                    'enrichment' => $preserve ? $previous->enrichment : null,
                 ]);
             }
 
@@ -241,36 +243,136 @@ class ScriptureImporter
 
     public function lookupLexicon(HebrewWord $word): bool
     {
-        $response = $this->client()
-            ->get('/api/volume/morphology/'.rawurlencode($word->hebrew));
+        return $this->applyLexiconPayload($word, $this->fetchMorphology($word->hebrew));
+    }
 
+    /** @return array<string, mixed>|null */
+    public function fetchMorphology(string $surfaceForm): ?array
+    {
+        $lookupForm = $this->tokenizer->lookupForm($surfaceForm);
+        $response = $this->client()->get('/api/volume/morphology/'.rawurlencode($lookupForm));
         if ($response->status() === 404) {
-            return false;
+            return null;
         }
 
         $payload = $response->throw()->json();
+
+        return is_array($payload) ? $payload : null;
+    }
+
+    /**
+     * @param  list<string>  $surfaceForms
+     * @return array<string, array<string, mixed>|null>
+     */
+    public function fetchMorphologies(array $surfaceForms): array
+    {
+        $results = [];
+        foreach (array_chunk(array_values(array_unique($surfaceForms)), 5) as $chunk) {
+            $responses = Http::pool(function ($pool) use ($chunk): array {
+                $baseUrl = rtrim((string) config('services.brit_hamashiach.url'), '/');
+
+                return array_map(
+                    fn (string $form) => $pool->as(base64_encode($form))->baseUrl($baseUrl)
+                        ->acceptJson()->timeout(25)->retry(3, 1000, throw: false)
+                        ->get('/api/volume/morphology/'.rawurlencode($this->tokenizer->lookupForm($form))),
+                    $chunk,
+                );
+            });
+
+            foreach ($chunk as $form) {
+                $response = $responses[base64_encode($form)] ?? null;
+                if (! $response instanceof Response || $response->status() === 404) {
+                    $results[$form] = null;
+
+                    continue;
+                }
+
+                if ($response->failed()) {
+                    $results[$form] = ['_error' => 'source-unavailable', '_status' => $response->status()];
+
+                    continue;
+                }
+
+                $payload = $response->throw()->json();
+                $results[$form] = is_array($payload) ? $payload : null;
+            }
+        }
+
+        return $results;
+    }
+
+    /** @param array<string, mixed>|null $payload */
+    public function applyLexiconPayload(HebrewWord $word, ?array $payload): bool
+    {
         $parses = is_array($payload) && is_array($payload['parses'] ?? null) ? $payload['parses'] : [];
-        $parse = $parses[0] ?? null;
-        if (! is_array($parse) || blank($parse['baseStrongs'] ?? null)) {
+        $candidates = collect($parses)
+            ->filter(fn (mixed $parse): bool => is_array($parse) && filled($parse['baseStrongs'] ?? null))
+            ->map(function (array $parse): array {
+                $strongs = $this->normalizeStrongs((string) $parse['baseStrongs']);
+                $fallback = $this->strongsFallback($strongs);
+                $sourceHeadword = $this->validHeadword($parse['root'] ?? null);
+
+                return [
+                    'lexical_id' => (string) ($parse['lemma'] ?? $parse['baseStrongs']),
+                    'strongs_number' => $strongs,
+                    'headword' => $fallback['hebrew'] ?? $sourceHeadword,
+                    'source_root' => $sourceHeadword,
+                    'morphology' => $parse['morphology'] ?? null,
+                    'morphology_description' => $parse['morphologyDescription'] ?? null,
+                    'definition' => $fallback['definition'] ?? $parse['definition'] ?? null,
+                ];
+            })->values();
+
+        $enrichment = $word->enrichment ?? [];
+        $enrichment['lemma']['candidates'] = $candidates->all();
+        $enrichment['lemma']['source'] = ($payload['_error'] ?? null) === 'source-unavailable'
+            ? 'morphology-source-unavailable'
+            : 'brithamashiach-morphology';
+        $enrichment['lemma']['source_surface_form'] = $payload['surfaceForm'] ?? null;
+        $enrichment['lemma']['source_surface_form_with_breaks'] = $payload['surfaceFormWithBreaks'] ?? null;
+
+        if ($candidates->isEmpty()) {
+            $enrichment['lemma']['status'] = 'unresolved';
+            $word->update(['enrichment' => $enrichment]);
+
             return false;
         }
 
-        $strongs = (string) $parse['baseStrongs'];
-        if (ctype_digit($strongs)) {
-            $strongs = 'H'.$strongs;
+        $strongsNumbers = $candidates->pluck('strongs_number')->filter()->unique()->values();
+        $selected = null;
+        if ($strongsNumbers->count() === 1) {
+            $selected = $candidates->firstWhere('strongs_number', $strongsNumbers->first());
+        } elseif ($word->lemma !== null && $strongsNumbers->contains($word->lemma->strongs_number)) {
+            $selected = $candidates->firstWhere('strongs_number', $word->lemma->strongs_number);
+        } elseif (($preferred = $this->preferredStrongs($word, $candidates->values()->all())) !== null) {
+            $selected = $candidates->firstWhere('strongs_number', $preferred);
         }
-        $hebrew = is_string($parse['root'] ?? null) && $parse['root'] !== '' ? $parse['root'] : $word->hebrew;
-        $sourceUrl = rtrim((string) config('services.brit_hamashiach.url'), '/')
-            .'/api/volume/morphology/'.rawurlencode($word->hebrew);
 
-        return DB::transaction(function () use ($word, $parse, $strongs, $hebrew, $sourceUrl): bool {
+        if (! is_array($selected) || blank($selected['headword'] ?? null)) {
+            $enrichment['lemma']['status'] = $candidates->count() > 1 ? 'proposed' : 'unresolved';
+            $word->update(['enrichment' => $enrichment]);
+
+            return false;
+        }
+
+        $strongs = (string) $selected['strongs_number'];
+        $hebrew = (string) $selected['headword'];
+        $sourceUrl = rtrim((string) config('services.brit_hamashiach.url'), '/')
+            .'/api/volume/morphology/'.rawurlencode($this->tokenizer->lookupForm($word->hebrew));
+
+        return DB::transaction(function () use ($word, $candidates, $selected, $strongs, $hebrew, $sourceUrl, $enrichment): bool {
             $lemma = Lemma::query()->firstOrCreate(
                 ['strongs_number' => $strongs],
                 ['hebrew' => $hebrew, 'normalized' => $this->tokenizer->normalize($hebrew)],
             );
+            if (in_array($lemma->hebrew, ['', 'N/A'], true) || $lemma->normalized === '') {
+                $lemma->hebrew = $hebrew;
+                $lemma->normalized = $this->tokenizer->normalize($hebrew);
+            }
             foreach ([
-                'definition' => $parse['definition'] ?? null,
-                'root' => $parse['root'] ?? null,
+                'transliteration' => data_get($this->strongsFallback($strongs), 'transliteration'),
+                'definition' => $selected['definition'] ?? null,
+                'root' => $selected['source_root'] ?? null,
                 'source_reference' => $sourceUrl,
             ] as $field => $value) {
                 if (blank($lemma->{$field}) && filled($value)) {
@@ -280,16 +382,121 @@ class ScriptureImporter
             $lemma->save();
 
             $morphology = $word->morphology ?? [];
-            if (filled($parse['morphology'] ?? null)) {
-                $morphology['code'] = $parse['morphology'];
+            $matchingParses = $candidates->where('strongs_number', $strongs)
+                ->unique(fn (array $candidate): string => (string) $candidate['morphology'].'|'.(string) $candidate['morphology_description'])
+                ->values();
+            if ($matchingParses->count() === 1) {
+                $morphology['code'] = $selected['morphology'] ?? null;
+                $morphology['description'] = $selected['morphology_description'] ?? null;
+                $morphology['status'] = 'confirmed';
+                unset($morphology['candidates']);
+            } else {
+                unset($morphology['code'], $morphology['description']);
+                $morphology['status'] = 'unresolved';
+                $morphology['candidates'] = $matchingParses->map(fn (array $candidate): array => array_filter([
+                    'code' => $candidate['morphology'],
+                    'description' => $candidate['morphology_description'],
+                ]))->values()->all();
             }
-            if (filled($parse['morphologyDescription'] ?? null)) {
-                $morphology['description'] = $parse['morphologyDescription'];
-            }
-            $word->update(['lemma_id' => $lemma->id, 'morphology' => $morphology]);
+
+            $enrichment['lemma'] = array_merge($enrichment['lemma'], [
+                'status' => 'confirmed',
+                'lexical_id' => $selected['lexical_id'],
+                'strongs_number' => $strongs,
+                'headword_source' => $this->strongsFallback($strongs) !== null ? 'verified-fallback' : 'source-root-field',
+            ]);
+            $word->update(['lemma_id' => $lemma->id, 'morphology' => array_filter($morphology, fn ($value) => $value !== null), 'enrichment' => $enrichment]);
 
             return true;
         });
+    }
+
+    private function normalizeStrongs(string $strongs): string
+    {
+        $strongs = trim($strongs);
+        if (preg_match('/^H?(\d+)\s*([a-z])?$/i', $strongs, $matches) === 1) {
+            return 'H'.$matches[1].strtolower($matches[2] ?? '');
+        }
+
+        return $strongs;
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $candidates
+     */
+    private function preferredStrongs(HebrewWord $word, array $candidates): ?string
+    {
+        $available = collect($candidates)->pluck('strongs_number')->filter()->unique();
+        $configured = config("hebrew.surface_lemma_preferences.{$word->normalized}");
+        if (is_string($configured) && $available->contains($configured)) {
+            return $configured;
+        }
+
+        $confirmedPeers = HebrewWord::query()
+            ->where('normalized', $word->normalized)
+            ->whereNotNull('lemma_id')
+            ->where('enrichment->lemma->status', 'confirmed')
+            ->with('lemma:id,strongs_number')
+            ->get()
+            ->pluck('lemma.strongs_number')
+            ->filter()
+            ->unique()
+            ->values();
+        if ($confirmedPeers->count() === 1 && $available->contains($confirmedPeers->first())) {
+            return (string) $confirmedPeers->first();
+        }
+
+        $scored = collect($candidates)
+            ->groupBy('strongs_number')
+            ->map(fn ($group): int => collect($group)->max(fn (array $candidate): int => $this->candidateEnglishScore($candidate, $word->passage->english_text)) ?? 0)
+            ->sortDesc();
+        if ($scored->isEmpty() || (int) $scored->first() < 2) {
+            return null;
+        }
+
+        $best = (int) $scored->first();
+        $winners = $scored->filter(fn (int $score): bool => $score === $best);
+
+        return $winners->count() === 1 ? (string) $winners->keys()->first() : null;
+    }
+
+    /** @param array<string, mixed> $candidate */
+    private function candidateEnglishScore(array $candidate, string $english): int
+    {
+        $definition = mb_strtolower((string) ($candidate['definition'] ?? ''));
+        if ($definition === '' || strtoupper($definition) === 'N/A') {
+            return 0;
+        }
+
+        $definition = preg_replace('/\d+[a-z]?\d*\)|\([^)]*\)/i', ' ', $definition) ?? $definition;
+        $terms = preg_split('/[^a-z]+/i', $definition, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $stop = ['the', 'and', 'with', 'from', 'that', 'this', 'have', 'has', 'into', 'upon', 'also', 'one', 'used', 'name'];
+        $english = mb_strtolower($english);
+        $score = 0;
+        foreach (array_unique($terms) as $term) {
+            if (mb_strlen($term) < 3 || in_array($term, $stop, true)) {
+                continue;
+            }
+            $stem = mb_substr($term, 0, min(5, mb_strlen($term)));
+            if (preg_match('/\b'.preg_quote($stem, '/').'[a-z]*\b/i', $english) === 1) {
+                $score += mb_strlen($term) >= 5 ? 3 : 2;
+            }
+        }
+
+        return $score;
+    }
+
+    /** @return array<string, string>|null */
+    private function strongsFallback(string $strongs): ?array
+    {
+        $fallback = config("hebrew.strongs_fallbacks.{$strongs}");
+
+        return is_array($fallback) ? $fallback : null;
+    }
+
+    private function validHeadword(mixed $value): ?string
+    {
+        return is_string($value) && $value !== '' && strtoupper($value) !== 'N/A' ? $value : null;
     }
 
     /** @return array<string, mixed> */

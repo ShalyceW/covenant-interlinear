@@ -20,6 +20,7 @@ class LemmasTable
                 TextColumn::make('transliteration')
                     ->searchable(),
                 TextColumn::make('root')
+                    ->placeholder('—')
                     ->searchable(),
                 TextColumn::make('strongs_number')
                     ->searchable(),

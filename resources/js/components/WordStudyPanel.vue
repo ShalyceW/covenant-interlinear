@@ -6,13 +6,28 @@ const props = defineProps<{ wordId: number | null }>();
 const emit = defineEmits<{ close: [] }>();
 const loading = ref(false);
 const study = ref<any>(null);
+const occurrencePage = ref(1);
 const tab = ref<'occurrences' | 'lexicon' | 'morphology' | 'sources'>(
     'occurrences',
 );
 
-const morphology = computed(() =>
-    Object.entries(study.value?.word?.morphology || {}),
+const morphology = computed<Array<[string, string]>>(() =>
+    Object.entries(study.value?.word?.morphology || {}).map(([key, value]) => [
+        key,
+        typeof value === 'object' ? JSON.stringify(value) : String(value),
+    ]),
 );
+
+async function loadStudy(page = 1) {
+    if (!props.wordId) return;
+    loading.value = true;
+    occurrencePage.value = page;
+    const response = await fetch(`/word-study/${props.wordId}?page=${page}`, {
+        headers: { Accept: 'application/json' },
+    });
+    study.value = response.ok ? await response.json() : null;
+    loading.value = false;
+}
 
 watch(
     () => props.wordId,
@@ -23,11 +38,7 @@ watch(
         }
         loading.value = true;
         tab.value = 'occurrences';
-        const response = await fetch(`/word-study/${id}`, {
-            headers: { Accept: 'application/json' },
-        });
-        study.value = response.ok ? await response.json() : null;
-        loading.value = false;
+        await loadStudy(1);
     },
 );
 
@@ -86,10 +97,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                         </p>
                         <p class="mt-3 text-lg">
                             {{
-                                study.word.english_gloss ||
-                                study.lemma?.definition ||
-                                'Meaning unresolved'
+                                study.word.english_gloss || 'Meaning unresolved'
                             }}
+                        </p>
+                        <p
+                            v-if="study.lemma"
+                            dir="rtl"
+                            lang="he"
+                            class="mt-4 text-sm text-stone-600"
+                        >
+                            <span dir="ltr" class="mr-2 font-sans">Lemma</span
+                            >{{ study.lemma.hebrew }}
                         </p>
                         <p
                             v-if="study.lemma?.strongs_number"
@@ -123,7 +141,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                     <div v-if="tab === 'occurrences'" class="py-5">
                         <p class="mb-4 text-sm text-stone-500">
                             {{ study.occurrence_count }} occurrences in the
-                            published corpus
+                            published corpus ·
+                            {{ study.match_type.replaceAll('_', ' ') }}
                         </p>
                         <div
                             v-for="occurrence in study.occurrences"
@@ -147,6 +166,31 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                             >
                                 {{ occurrence.english }}
                             </p>
+                        </div>
+                        <div
+                            v-if="study.pagination.last_page > 1"
+                            class="mt-5 flex items-center justify-between text-sm"
+                        >
+                            <button
+                                class="rounded border border-stone-300 px-3 py-2 disabled:opacity-40"
+                                :disabled="occurrencePage <= 1"
+                                @click="loadStudy(occurrencePage - 1)"
+                            >
+                                Previous
+                            </button>
+                            <span
+                                >Page {{ occurrencePage }} of
+                                {{ study.pagination.last_page }}</span
+                            >
+                            <button
+                                class="rounded border border-stone-300 px-3 py-2 disabled:opacity-40"
+                                :disabled="
+                                    occurrencePage >= study.pagination.last_page
+                                "
+                                @click="loadStudy(occurrencePage + 1)"
+                            >
+                                Next
+                            </button>
                         </div>
                     </div>
                     <div v-else-if="tab === 'lexicon'" class="space-y-4 py-5">
@@ -179,11 +223,33 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                             Morphology has not been resolved.
                         </p>
                     </div>
-                    <div v-else class="py-5 text-sm leading-relaxed">
+                    <div v-else class="space-y-4 py-5 text-sm leading-relaxed">
                         <p>
+                            <strong>Hebrew scripture:</strong>
                             {{
-                                study.lemma?.source_reference ||
-                                'No lexical source has been recorded.'
+                                study.sources.hebrew_scripture ||
+                                'Source URL unavailable'
+                            }}
+                        </p>
+                        <p>
+                            <strong>Covenant of Christ English:</strong>
+                            {{
+                                study.sources.english_context ||
+                                'Passage reference unavailable'
+                            }}
+                        </p>
+                        <p>
+                            <strong>Supporting Hebrew dictionary:</strong>
+                            {{
+                                study.sources.supporting_lexicon ||
+                                'No verified lexical source assigned'
+                            }}
+                        </p>
+                        <p>
+                            <strong>Occurrence annotation:</strong>
+                            {{
+                                study.sources.annotation ||
+                                'No generated or editorial annotation'
                             }}
                         </p>
                     </div>

@@ -27,13 +27,13 @@ defineEmits<{ select: [wordId: number] }>();
             v-if="showTransliteration"
             class="mt-1 text-[0.65em] text-stone-500 italic"
         >
-            {{ word.transliteration || '—' }}
+            {{ word.transliteration || '\u00a0' }}
         </span>
         <span
             v-if="showGlosses"
             class="mt-0.5 max-w-28 text-[0.62em] leading-tight text-stone-700"
         >
-            {{ word.english_gloss || 'unresolved' }}
+            {{ word.english_gloss || '\u00a0' }}
         </span>
     </button>
 </template>
