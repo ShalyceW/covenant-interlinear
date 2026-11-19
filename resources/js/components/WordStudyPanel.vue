@@ -60,7 +60,8 @@ function approveLemma() {
         {
             preserveScroll: true,
             preserveState: true,
-            onSuccess: () => loadStudy(occurrencePage.value, biblicalPage.value),
+            onSuccess: () =>
+                loadStudy(occurrencePage.value, biblicalPage.value),
             onFinish: () => {
                 savingLemma.value = false;
             },
@@ -83,7 +84,8 @@ function approveGloss() {
         {
             preserveScroll: true,
             preserveState: true,
-            onSuccess: () => loadStudy(occurrencePage.value, biblicalPage.value),
+            onSuccess: () =>
+                loadStudy(occurrencePage.value, biblicalPage.value),
             onFinish: () => {
                 savingGloss.value = false;
             },
@@ -167,7 +169,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                             v-if="study.review && !study.word.english_gloss"
                             class="mt-4 rounded border border-red-200 bg-red-50 p-3"
                         >
-                            <p class="text-xs font-semibold tracking-wide text-red-800 uppercase">
+                            <p
+                                class="text-xs font-semibold tracking-wide text-red-800 uppercase"
+                            >
                                 Suggested word gloss
                             </p>
                             <div class="mt-2 flex flex-col gap-2 sm:flex-row">
@@ -177,13 +181,16 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                                     aria-label="Suggested word gloss"
                                 >
                                     <option
-                                        v-for="option in study.review.gloss_options"
+                                        v-for="option in study.review
+                                            .gloss_options"
                                         :key="option"
                                         :value="option"
                                     >
                                         {{ option }}
                                     </option>
-                                    <option value="__custom">Custom gloss…</option>
+                                    <option value="__custom">
+                                        Custom gloss…
+                                    </option>
                                 </select>
                                 <button
                                     type="button"
@@ -191,7 +198,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                                     :disabled="savingGloss || !glossValue"
                                     @click="approveGloss"
                                 >
-                                    {{ savingGloss ? 'Saving…' : 'Approve gloss' }}
+                                    {{
+                                        savingGloss
+                                            ? 'Saving…'
+                                            : 'Approve gloss'
+                                    }}
                                 </button>
                             </div>
                             <input
@@ -207,14 +218,23 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                                 v-if="!study.review.gloss_options.length"
                                 class="mt-2 text-xs text-red-700"
                             >
-                                No source-backed alternate was found. Choose Custom gloss to enter an editorial value.
+                                No source-backed alternate was found. Choose
+                                Custom gloss to enter an editorial value.
                             </p>
                         </div>
                         <div
-                            v-if="study.review && study.review.lemma_status !== 'confirmed' && study.review.lemma_options.length"
+                            v-if="
+                                study.review &&
+                                study.review.lemma_status !== 'confirmed' &&
+                                study.review.lemma_options.length
+                            "
                             class="mt-3 rounded border border-amber-200 bg-amber-50 p-3"
                         >
-                            <p class="text-xs font-semibold tracking-wide text-amber-900 uppercase">Suggested lemma</p>
+                            <p
+                                class="text-xs font-semibold tracking-wide text-amber-900 uppercase"
+                            >
+                                Suggested lemma
+                            </p>
                             <div class="mt-2 flex flex-col gap-2 sm:flex-row">
                                 <select
                                     v-model="selectedLemma"
@@ -222,7 +242,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                                     aria-label="Suggested lemma"
                                 >
                                     <option
-                                        v-for="option in study.review.lemma_options"
+                                        v-for="option in study.review
+                                            .lemma_options"
                                         :key="option.value"
                                         :value="option.value"
                                     >
@@ -235,7 +256,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
                                     :disabled="savingLemma || !selectedLemma"
                                     @click="approveLemma"
                                 >
-                                    {{ savingLemma ? 'Saving…' : 'Approve lemma' }}
+                                    {{
+                                        savingLemma
+                                            ? 'Saving…'
+                                            : 'Approve lemma'
+                                    }}
                                 </button>
                             </div>
                         </div>
