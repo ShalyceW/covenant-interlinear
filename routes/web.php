@@ -3,6 +3,7 @@
 use App\Http\Controllers\ConcordanceController;
 use App\Http\Controllers\PrintController;
 use App\Http\Controllers\ScriptureController;
+use App\Http\Controllers\WordReviewController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', [ScriptureController::class, 'home'])->name('home');
@@ -13,6 +14,7 @@ Route::get('/concordance', ConcordanceController::class)->name('concordance.inde
 
 Route::middleware(['auth', 'verified'])->group(function () {
     Route::inertia('dashboard', 'Dashboard')->name('dashboard');
+    Route::patch('/editor/words/{word}', [WordReviewController::class, 'update'])->name('words.review');
 });
 
 require __DIR__.'/settings.php';

@@ -24,6 +24,17 @@ class HebrewWordInfolist
                     ->placeholder('-'),
                 TextEntry::make('english_gloss')
                     ->placeholder('-'),
+                TextEntry::make('passage.hebrew_text')
+                    ->label('Hebrew context')
+                    ->extraAttributes(['dir' => 'rtl', 'lang' => 'he'])
+                    ->columnSpanFull(),
+                TextEntry::make('passage.english_text')
+                    ->label('Covenant of Christ English context')
+                    ->columnSpanFull(),
+                TextEntry::make('enrichment.lemma.status')->label('Lemma review status')->placeholder('-'),
+                TextEntry::make('enrichment.gloss.status')->label('Gloss review status')->placeholder('-'),
+                TextEntry::make('enrichment.transliteration.status')->label('Transliteration review status')->placeholder('-'),
+                TextEntry::make('enrichment.gloss.source')->label('Gloss source')->placeholder('-'),
                 TextEntry::make('morphology')
                     ->placeholder('-')
                     ->columnSpanFull(),

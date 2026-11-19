@@ -24,6 +24,10 @@ class LemmasTable
                     ->searchable(),
                 TextColumn::make('strongs_number')
                     ->searchable(),
+                TextColumn::make('base_strongs_number')
+                    ->searchable()
+                    ->toggleable(isToggledHiddenByDefault: true),
+                TextColumn::make('biblical_references_count')->counts('biblicalReferences')->label('Bible refs')->sortable(),
                 TextColumn::make('occurrences_count')->counts('occurrences')->label('Occurrences')->sortable(),
                 TextColumn::make('created_at')
                     ->dateTime()

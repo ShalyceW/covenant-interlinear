@@ -21,13 +21,20 @@ class EditHebrewWord extends EditRecord
         if (! $record instanceof HebrewWord) {
             return $data;
         }
-        $enrichment = is_array($data['enrichment'] ?? null) ? $data['enrichment'] : ($record->enrichment ?? []);
+        $submittedEnrichment = is_array($data['enrichment'] ?? null) ? $data['enrichment'] : [];
+        $enrichment = array_replace_recursive($record->enrichment ?? [], $submittedEnrichment);
         foreach (['lemma_id' => 'lemma', 'transliteration' => 'transliteration', 'english_gloss' => 'gloss', 'morphology' => 'morphology'] as $field => $key) {
             if (array_key_exists($field, $data) && $data[$field] !== $record->{$field}) {
                 $enrichment[$key] = array_merge(is_array($enrichment[$key] ?? null) ? $enrichment[$key] : [], [
                     'status' => 'confirmed',
                     'source' => 'editorial',
                 ]);
+            }
+        }
+        foreach (['lemma', 'gloss', 'transliteration'] as $key) {
+            $submittedStatus = data_get($submittedEnrichment, "{$key}.status");
+            if ($submittedStatus !== null && $submittedStatus !== data_get($record->enrichment, "{$key}.status")) {
+                $enrichment[$key]['source'] = 'editorial';
             }
         }
         $data['enrichment'] = $enrichment;

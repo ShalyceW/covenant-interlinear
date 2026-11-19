@@ -139,7 +139,7 @@ test('a missing remote morphology entry returns a normal not-found result', func
         ->and($word->fresh()->lemma_id)->toBeNull();
 });
 
-test('lexicon lookup preserves ambiguous candidates instead of choosing the first parse', function () {
+test('lexicon lookup links its first ambiguous candidate as an explicit proposal', function () {
     fakeScriptureSource();
     app(ScriptureImporter::class)->importChapter('1nefi', 1);
     $word = HebrewWord::query()->where('position', 1)->firstOrFail();
@@ -148,8 +148,8 @@ test('lexicon lookup preserves ambiguous candidates instead of choosing the firs
         ['lemma' => '1696', 'baseStrongs' => '1696', 'root' => 'דָבַר', 'morphology' => 'HVqr'],
     ]];
 
-    expect(app(ScriptureImporter::class)->applyLexiconPayload($word, $payload))->toBeFalse()
-        ->and($word->fresh()->lemma_id)->toBeNull()
+    expect(app(ScriptureImporter::class)->applyLexiconPayload($word, $payload))->toBeTrue()
+        ->and($word->fresh()->lemma->strongs_number)->toBe('H1697')
         ->and($word->fresh()->enrichment['lemma']['status'])->toBe('proposed')
         ->and($word->fresh()->enrichment['lemma']['candidates'])->toHaveCount(2);
 });

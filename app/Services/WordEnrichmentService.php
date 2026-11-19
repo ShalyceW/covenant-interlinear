@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\BiblicalReference;
 use App\Models\Chapter;
 use App\Models\HebrewWord;
 use App\Models\Lemma;
@@ -16,7 +17,7 @@ class WordEnrichmentService
     ) {}
 
     /** @return array<string, mixed> */
-    public function enrich(Chapter $chapter, bool $dryRun = false): array
+    public function enrich(Chapter $chapter, bool $dryRun = false, bool $retryUnresolved = false): array
     {
         $chapter->loadMissing('book');
         $before = $this->coverage($chapter);
@@ -28,7 +29,7 @@ class WordEnrichmentService
             $word->normalized = $this->tokenizer->normalize($word->hebrew);
         }
         $remoteForms = array_values($words
-            ->filter(fn (HebrewWord $word): bool => $this->needsRemoteLookup($word))
+            ->filter(fn (HebrewWord $word): bool => $this->needsRemoteLookup($word, $retryUnresolved))
             ->filter(fn (HebrewWord $word): bool => (bool) data_get($word->morphology, 'found_in_hebrew_bible'))
             ->map(fn (HebrewWord $word): string => $word->hebrew)->unique()->all());
         $payloads = $this->importer->fetchMorphologies($remoteForms);
@@ -51,7 +52,21 @@ class WordEnrichmentService
                 }
 
                 if (! $this->hasManualLemma($word)) {
-                    if (($local = $this->localLemma($word)) !== null) {
+                    $preferred = config("hebrew.surface_lemma_preferences.{$word->normalized}");
+                    $candidateStrongNumbers = collect((array) data_get($enrichment, 'lemma.candidates', []))->pluck('strongs_number');
+                    if (is_string($preferred)
+                        && $candidateStrongNumbers->contains($preferred)
+                        && $word->lemma?->strongs_number !== $preferred
+                        && $this->importer->applyStoredProposal($word, forceProposed: false)) {
+                        $word->refresh()->load('lemma');
+                        $enrichment = $word->enrichment ?? [];
+                    } elseif ($word->lemma_id === null
+                        && data_get($enrichment, 'lemma.status') === 'proposed'
+                        && ((array) data_get($enrichment, 'lemma.candidates', [])) !== []
+                        && $this->importer->applyStoredProposal($word)) {
+                        $word->refresh()->load('lemma');
+                        $enrichment = $word->enrichment ?? [];
+                    } elseif (($local = $this->localLemma($word)) !== null) {
                         $strongs = $local['strongs_number'] ?? null;
                         $identity = is_string($strongs)
                             ? ['strongs_number' => $strongs]
@@ -81,7 +96,7 @@ class WordEnrichmentService
                             'description' => 'Covenant of Christ proper name',
                             'status' => 'confirmed',
                         ]);
-                    } elseif ($this->needsRemoteLookup($word) && array_key_exists($word->hebrew, $payloads)) {
+                    } elseif ($this->needsRemoteLookup($word, $retryUnresolved) && array_key_exists($word->hebrew, $payloads)) {
                         $word->enrichment = $enrichment;
                         $word->save();
                         $this->importer->applyLexiconPayload($word, $payloads[$word->hebrew]);
@@ -92,6 +107,15 @@ class WordEnrichmentService
                             'status' => 'unresolved',
                             'source' => data_get($word->morphology, 'found_in_hebrew_bible') ? 'morphology-source-no-match' : 'source-not-in-hebrew-bible',
                         ]);
+                    }
+
+                    if ($word->lemma_id === null && $this->inferConfirmedComponentCandidates($word, $enrichment)) {
+                        $word->enrichment = $enrichment;
+                        $word->save();
+                        if ($this->importer->applyStoredProposal($word)) {
+                            $word->refresh()->load('lemma');
+                            $enrichment = $word->enrichment ?? [];
+                        }
                     }
                 }
 
@@ -123,6 +147,11 @@ class WordEnrichmentService
                     }
                 }
 
+                if ($this->contextualGlossOverride($word) !== null && ! $this->hasManualLemma($word)) {
+                    $this->applyContextualProvisionalLemma($word, $enrichment);
+                    $word->enrichment = $enrichment;
+                }
+
                 $enrichment['sources'] = array_filter([
                     'hebrew_scripture' => $chapter->source_url,
                     'english_context' => $word->passage->reference,
@@ -141,10 +170,12 @@ class WordEnrichmentService
                 'book' => $chapter->book->name,
                 'chapter' => $chapter->number,
                 'dry_run' => $dryRun,
+                'retry_unresolved' => $retryUnresolved,
                 'records_changed' => $changed,
                 'lemma_records_corrected' => $repairedLemmas,
                 'before' => $before,
                 'after' => $after,
+                'unresolved_reasons' => $this->unresolvedReasons($chapter),
             ];
 
             $dryRun ? DB::rollBack() : DB::commit();
@@ -161,6 +192,7 @@ class WordEnrichmentService
     public function coverage(Chapter $chapter): array
     {
         $query = HebrewWord::query()->whereHas('passage', fn ($query) => $query->where('chapter_id', $chapter->id));
+        $lemmaIds = (clone $query)->whereNotNull('lemma_id')->distinct()->pluck('lemma_id');
 
         return [
             'total_words' => (clone $query)->count(),
@@ -168,6 +200,15 @@ class WordEnrichmentService
             'contextual_glosses' => (clone $query)->whereNotNull('english_gloss')->where('english_gloss', '!=', '')->count(),
             'confirmed_lemmas' => (clone $query)->whereNotNull('lemma_id')->where('enrichment->lemma->status', 'confirmed')->count(),
             'proposed_lemmas' => (clone $query)->where('enrichment->lemma->status', 'proposed')->count(),
+            'strongs_matches' => (clone $query)->where('enrichment->lemma->status', 'confirmed')
+                ->whereHas('lemma', fn ($query) => $query->whereNotNull('strongs_number'))->count(),
+            'words_without_verified_strongs' => (clone $query)->where(function ($query): void {
+                $query->whereNull('lemma_id')
+                    ->orWhereHas('lemma', fn ($lemma) => $lemma->whereNull('strongs_number'));
+            })->count(),
+            'dictionary_entries_completed' => Lemma::query()->whereIn('id', $lemmaIds)
+                ->whereNotNull('definition')->where('definition', '!=', '')->count(),
+            'biblical_references_imported' => BiblicalReference::query()->whereIn('lemma_id', $lemmaIds)->count(),
             'unresolved_words' => (clone $query)->where(function ($query): void {
                 $query->whereNull('enrichment->lemma->status')
                     ->orWhere('enrichment->lemma->status', 'unresolved');
@@ -181,6 +222,21 @@ class WordEnrichmentService
                     ->orWhereIn('enrichment->transliteration->status', ['proposed', 'unresolved']);
             })->count(),
         ];
+    }
+
+    /** @return array<string, int> */
+    private function unresolvedReasons(Chapter $chapter): array
+    {
+        return HebrewWord::query()
+            ->whereHas('passage', fn ($query) => $query->where('chapter_id', $chapter->id))
+            ->whereIn('enrichment->lemma->status', ['proposed', 'unresolved'])
+            ->get()
+            ->groupBy(fn (HebrewWord $word): string => (string) (
+                data_get($word->enrichment, 'lemma.source') ?: 'no-source-status'
+            ))
+            ->map->count()
+            ->sortDesc()
+            ->all();
     }
 
     private function repairLegacyLemmas(): int
@@ -254,7 +310,7 @@ class WordEnrichmentService
         }
 
         if (! $word->hasConfirmedLemma() || $word->lemma === null) {
-            return null;
+            return $this->candidateGloss($word);
         }
 
         $strongs = $word->lemma->strongs_number;
@@ -327,6 +383,83 @@ class WordEnrichmentService
         return $gloss;
     }
 
+    private function candidateGloss(HebrewWord $word): ?string
+    {
+        $definitions = collect((array) data_get($word->enrichment, 'lemma.candidates', []))
+            ->pluck('definition')
+            ->filter(fn (mixed $definition): bool => is_string($definition) && $definition !== '' && strtoupper($definition) !== 'N/A');
+
+        foreach ($definitions as $definition) {
+            if (($gloss = $this->definitionGloss((string) $definition, $word->passage->english_text)) !== null) {
+                return $gloss;
+            }
+        }
+
+        foreach ($definitions as $definition) {
+            $clean = preg_replace('/^\s*:?\s*|\b\d+[a-z]?\d*\)\s*/i', '', (string) $definition) ?? (string) $definition;
+            $sense = trim(explode(',', explode(';', explode("\n", $clean)[0])[0])[0]);
+            $sense = preg_replace('/^to\s+/i', '', $sense) ?? $sense;
+            if ($this->isReadableSense($sense) && str_word_count($sense) <= 2) {
+                return str_replace(' ', '-', mb_strtolower($sense));
+            }
+        }
+
+        return null;
+    }
+
+    /** @param array<string, mixed> $enrichment */
+    private function inferConfirmedComponentCandidates(HebrewWord $word, array &$enrichment): bool
+    {
+        if (((array) data_get($enrichment, 'lemma.candidates', [])) !== []) {
+            return false;
+        }
+
+        $forms = preg_split('/\x{05BE}/u', $this->tokenizer->lookupForm($word->hebrew), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $candidates = collect(array_reverse($forms))->map(function (string $form): ?array {
+            $normalized = $this->tokenizer->normalize($form);
+            $lemma = Lemma::query()
+                ->where('normalized', $normalized)
+                ->whereNotNull('strongs_number')
+                ->orderByRaw('definition is null')
+                ->first();
+            $peer = HebrewWord::query()
+                ->with('lemma')
+                ->where('normalized', $normalized)
+                ->whereNotNull('lemma_id')
+                ->where('enrichment->lemma->status', 'confirmed')
+                ->whereHas('lemma', fn ($query) => $query->whereNotNull('strongs_number'))
+                ->first();
+            $lemma ??= $peer?->lemma;
+            if ($lemma === null) {
+                return null;
+            }
+
+            return [
+                'lexical_id' => $lemma->source_lexical_id ?? $lemma->strongs_number,
+                'strongs_number' => $lemma->strongs_number,
+                'base_strongs_number' => $lemma->base_strongs_number ?? $lemma->strongs_number,
+                'headword' => $lemma->hebrew,
+                'dictionary_match' => $lemma->strongs_number,
+                'definition' => $lemma->definition,
+                'dictionary_transliteration' => $lemma->transliteration,
+                'occurrences' => [],
+            ];
+        })->filter()->unique('strongs_number')->values();
+
+        if ($candidates->isEmpty()) {
+            return false;
+        }
+
+        $enrichment['lemma'] = array_merge($enrichment['lemma'] ?? [], [
+            'status' => 'proposed',
+            'source' => 'confirmed-component-analysis',
+            'candidates' => $candidates->all(),
+            'evidence' => 'A component of this source form has the same written form as a Brit HaMashiach/Strong’s or supporting Hebrew lexicon entry.',
+        ]);
+
+        return true;
+    }
+
     private function definitionGloss(?string $definition, string $english): ?string
     {
         if (blank($definition) || strtoupper(trim((string) $definition)) === 'N/A') {
@@ -352,6 +485,35 @@ class WordEnrichmentService
         $gloss = is_array($passage) ? ($passage[$word->hebrew] ?? null) : null;
 
         return is_string($gloss) && $gloss !== '' ? $gloss : null;
+    }
+
+    /** @param array<string, mixed> $enrichment */
+    private function applyContextualProvisionalLemma(HebrewWord $word, array &$enrichment): void
+    {
+        if (data_get($enrichment, 'lemma.status') === 'confirmed') {
+            return;
+        }
+
+        if ($word->lemma_id === null) {
+            $lemma = Lemma::query()->firstOrCreate(
+                ['normalized' => $word->normalized, 'strongs_number' => null],
+                [
+                    'hebrew' => $this->tokenizer->lookupForm($word->hebrew),
+                    'transliteration' => $word->transliteration,
+                    'definition' => str_replace('-', ' ', (string) $word->english_gloss),
+                    'source_reference' => 'contextual-analysis://'.$word->passage->reference,
+                ],
+            );
+            $word->lemma_id = $lemma->id;
+            $word->setRelation('lemma', $lemma);
+        }
+
+        $enrichment['lemma'] = array_merge($enrichment['lemma'] ?? [], [
+            'status' => 'proposed',
+            'source' => 'contextual-analysis-provisional-entry',
+            'evidence' => 'Passage-level Hebrew grammar and Covenant of Christ English context; requires lexical review.',
+        ]);
+        $word->enrichment = $enrichment;
     }
 
     private function configuredGloss(mixed $configured, string $english): ?string
@@ -564,7 +726,7 @@ class WordEnrichmentService
             && ! str_contains((string) $word->lemma->source_reference, '/api/volume/morphology/');
     }
 
-    private function needsRemoteLookup(HebrewWord $word): bool
+    private function needsRemoteLookup(HebrewWord $word, bool $retryUnresolved = false): bool
     {
         if ($this->hasManualLemma($word) || $this->localLemma($word) !== null) {
             return false;
@@ -573,8 +735,12 @@ class WordEnrichmentService
         $source = data_get($word->enrichment, 'lemma.source');
         $status = data_get($word->enrichment, 'lemma.status');
 
-        if ($word->lemma_id === null && in_array($status, ['proposed', 'unresolved'], true)) {
+        if ($retryUnresolved && $word->lemma_id === null && in_array($status, ['proposed', 'unresolved'], true)) {
             return true;
+        }
+
+        if ($source === 'brithamashiach-morphology' && array_key_exists('candidates', (array) data_get($word->enrichment, 'lemma', []))) {
+            return false;
         }
 
         return $source === null

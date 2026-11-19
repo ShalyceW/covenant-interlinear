@@ -65,6 +65,8 @@ class ChaptersTable
                                 "{$after['total_words']} total",
                                 "{$after['confirmed_lemmas']} confirmed lemmas",
                                 "{$after['proposed_lemmas']} proposed lemmas",
+                                "{$after['strongs_matches']} Strong’s matches",
+                                "{$after['biblical_references_imported']} biblical reference rows",
                                 "{$after['unresolved_words']} unresolved",
                                 "{$after['transliterations']} transliterations",
                                 "{$after['contextual_glosses']} glosses",
@@ -72,6 +74,20 @@ class ChaptersTable
                             ]))
                             ->success()
                             ->persistent()
+                            ->send();
+                    }),
+                Action::make('retryUnresolvedWords')
+                    ->label('Retry unresolved')
+                    ->icon('heroicon-o-arrow-path')
+                    ->requiresConfirmation()
+                    ->modalDescription('Refresh only unresolved or proposed morphology lookups. Previously imported biblical references remain available if the source is unavailable.')
+                    ->action(function (Chapter $record, WordEnrichmentService $service): void {
+                        $result = $service->enrich($record, retryUnresolved: true);
+                        $after = $result['after'];
+                        Notification::make()
+                            ->title('Unresolved word lookups retried')
+                            ->body("{$after['confirmed_lemmas']} confirmed · {$after['proposed_lemmas']} proposed · {$after['unresolved_words']} unresolved")
+                            ->success()
                             ->send();
                     }),
                 ViewAction::make(),

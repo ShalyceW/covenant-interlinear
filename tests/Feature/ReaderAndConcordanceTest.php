@@ -1,9 +1,11 @@
 <?php
 
+use App\Models\BiblicalReference;
 use App\Models\Book;
 use App\Models\Chapter;
 use App\Models\HebrewWord;
 use App\Models\Lemma;
+use App\Models\User;
 use Inertia\Testing\AssertableInertia as Assert;
 
 function scriptureChapter(bool $published = true): Chapter
@@ -38,6 +40,67 @@ test('the public reader returns the selected published chapter in source order',
         ->where('chapter.passages.0.english_text', 'I, Nephi')
         ->where('chapter.passages.0.words.0.hebrew', 'אָנֹכִי')
         ->where('chapter.passages.0.words.1.english_gloss', 'Nephi'));
+});
+
+test('editorial proposal metadata stays out of reader word rows', function () {
+    scriptureChapter();
+    $word = HebrewWord::query()->where('normalized', 'נפי')->firstOrFail();
+    $word->update(['enrichment' => [
+        'lemma' => ['status' => 'proposed', 'candidates' => [[
+            'strongs_number' => 'H5030', 'headword' => 'נָבִיא', 'definition' => 'prophet',
+        ]]],
+        'gloss' => ['status' => 'proposed'],
+    ]]);
+
+    $this->get('/library/1nefi/1')->assertInertia(fn (Assert $page) => $page
+        ->missing('chapter.passages.0.words.1.review'));
+
+    $admin = User::factory()->create(['is_admin' => true, 'email_verified_at' => now()]);
+    $this->actingAs($admin)->get('/library/1nefi/1')->assertInertia(fn (Assert $page) => $page
+        ->missing('chapter.passages.0.words.1.review'));
+});
+
+test('only administrators can approve proposed glosses from the reader', function () {
+    scriptureChapter();
+    $word = HebrewWord::query()->where('normalized', 'אנכי')->firstOrFail();
+    $ordinary = User::factory()->create(['email_verified_at' => now()]);
+    $admin = User::factory()->create(['is_admin' => true, 'email_verified_at' => now()]);
+
+    $this->actingAs($ordinary)->patch(route('words.review', $word), [
+        'field' => 'gloss', 'value' => 'I',
+    ])->assertForbidden();
+
+    $this->actingAs($admin)->patch(route('words.review', $word), [
+        'field' => 'gloss', 'value' => 'I',
+    ])->assertRedirect();
+
+    expect($word->fresh()->english_gloss)->toBe('I')
+        ->and($word->fresh()->enrichment['gloss']['status'])->toBe('confirmed')
+        ->and($word->fresh()->enrichment['gloss']['source'])->toBe('editorial');
+});
+
+test('word study exposes gloss dropdown options only to administrators', function () {
+    scriptureChapter();
+    $word = HebrewWord::query()->where('normalized', 'נפי')->firstOrFail();
+    $word->update([
+        'english_gloss' => null,
+        'enrichment' => [
+            'lemma' => ['status' => 'proposed', 'candidates' => [[
+                'strongs_number' => 'H5030', 'headword' => 'נָבִיא', 'definition' => 'prophet, spokesman',
+            ]]],
+            'gloss' => ['status' => 'unresolved'],
+        ],
+    ]);
+
+    $this->getJson(route('word-study.show', $word))
+        ->assertOk()
+        ->assertJsonPath('review', null);
+
+    $admin = User::factory()->create(['is_admin' => true, 'email_verified_at' => now()]);
+    $this->actingAs($admin)->getJson(route('word-study.show', $word))
+        ->assertOk()
+        ->assertJsonPath('review.gloss_status', 'unresolved')
+        ->assertJsonPath('review.gloss_options.0', 'prophet');
 });
 
 test('unpublished chapters are excluded from the reader and concordance', function () {
@@ -99,4 +162,35 @@ test('print view uses the same passage and gloss data', function () {
     $this->get('/library/1nefi/1/print')->assertOk()
         ->assertSee('I, Nephi')
         ->assertSee('Nephi');
+});
+
+test('word study keeps Covenant and Biblical occurrence counts separate', function () {
+    scriptureChapter();
+    $word = HebrewWord::query()->where('normalized', 'נפי')->firstOrFail();
+    $word->update(['enrichment' => ['lemma' => ['status' => 'confirmed', 'source' => 'editorial']]]);
+    BiblicalReference::create([
+        'lemma_id' => $word->lemma_id,
+        'source' => 'Brit HaMashiach morphology',
+        'raw_reference' => '1Sam.9',
+        'normalized_reference' => '1Sam.9',
+        'book' => '1 Samuel',
+        'source_position' => 1,
+        'source_url' => 'https://brithamashiach.org/api/volume/morphology/test',
+    ]);
+    BiblicalReference::create([
+        'lemma_id' => $word->lemma_id,
+        'source' => 'Brit HaMashiach morphology',
+        'raw_reference' => '1Sam.9',
+        'normalized_reference' => '1Sam.9',
+        'book' => '1 Samuel',
+        'source_position' => 2,
+    ]);
+
+    $this->getJson("/word-study/{$word->id}")->assertOk()
+        ->assertJsonPath('occurrence_count', 1)
+        ->assertJsonPath('biblical_reference_count', 2)
+        ->assertJsonPath('biblical_unique_location_count', 1)
+        ->assertJsonPath('biblical_references.0.raw_reference', '1Sam.9')
+        ->assertJsonPath('biblical_references.0.chapter', null)
+        ->assertJsonPath('occurrences.0.book_slug', '1nefi');
 });

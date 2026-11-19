@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\BiblicalReference;
 use App\Models\Book;
 use App\Models\Chapter;
 use App\Models\HebrewWord;
@@ -246,6 +247,33 @@ class ScriptureImporter
         return $this->applyLexiconPayload($word, $this->fetchMorphology($word->hebrew));
     }
 
+    public function applyStoredProposal(HebrewWord $word, bool $forceProposed = true): bool
+    {
+        $candidates = (array) data_get($word->enrichment, 'lemma.candidates', []);
+        if ($candidates === []) {
+            return false;
+        }
+
+        $parses = collect($candidates)->filter(fn (mixed $candidate): bool => is_array($candidate))->map(
+            fn (array $candidate): array => [
+                'lemma' => $candidate['lexical_id'] ?? $candidate['strongs_number'] ?? null,
+                'baseStrongs' => $candidate['strongs_number'] ?? null,
+                'root' => $candidate['headword'] ?? null,
+                'definition' => $candidate['definition'] ?? null,
+                'morphology' => $candidate['morphology'] ?? null,
+                'morphologyDescription' => $candidate['morphology_description'] ?? null,
+                'occurrences' => $candidate['occurrences'] ?? [],
+            ],
+        )->values()->all();
+
+        return $this->applyLexiconPayload($word, [
+            '_force_proposed' => $forceProposed,
+            'surfaceForm' => data_get($word->enrichment, 'lemma.source_surface_form'),
+            'surfaceFormWithBreaks' => data_get($word->enrichment, 'lemma.source_surface_form_with_breaks'),
+            'parses' => $parses,
+        ]);
+    }
+
     /** @return array<string, mixed>|null */
     public function fetchMorphology(string $surfaceForm): ?array
     {
@@ -304,30 +332,66 @@ class ScriptureImporter
     /** @param array<string, mixed>|null $payload */
     public function applyLexiconPayload(HebrewWord $word, ?array $payload): bool
     {
+        $enrichment = $word->enrichment ?? [];
+        if (($payload['_error'] ?? null) === 'source-unavailable') {
+            $enrichment['lemma']['refresh_failure'] = [
+                'source' => 'brithamashiach-morphology',
+                'status' => $payload['_status'] ?? null,
+                'at' => now()->toIso8601String(),
+            ];
+            if (blank(data_get($enrichment, 'lemma.status'))) {
+                $enrichment['lemma']['status'] = 'unresolved';
+                $enrichment['lemma']['source'] = 'morphology-source-unavailable';
+            }
+            $word->update(['enrichment' => $enrichment]);
+
+            return false;
+        }
+
         $parses = is_array($payload) && is_array($payload['parses'] ?? null) ? $payload['parses'] : [];
         $candidates = collect($parses)
             ->filter(fn (mixed $parse): bool => is_array($parse) && filled($parse['baseStrongs'] ?? null))
             ->map(function (array $parse): array {
                 $strongs = $this->normalizeStrongs((string) $parse['baseStrongs']);
+                $baseStrongs = $this->baseStrongs($strongs);
                 $fallback = $this->strongsFallback($strongs);
+                $dictionary = $this->dictionaryLemma($strongs);
+                $baseDictionary = $dictionary === null && $baseStrongs !== $strongs
+                    ? $this->dictionaryLemma($baseStrongs)
+                    : null;
                 $sourceHeadword = $this->validHeadword($parse['root'] ?? null);
+                $dictionaryHeadword = $dictionary === null ? null : $dictionary->hebrew;
+                $baseDictionaryHeadword = $baseDictionary === null ? null : $baseDictionary->hebrew;
+                $dictionaryMatch = $dictionary === null
+                    ? ($baseDictionary === null ? null : $baseDictionary->strongs_number)
+                    : $dictionary->strongs_number;
+                $dictionaryDefinition = $dictionary === null ? null : $dictionary->definition;
+                $baseDictionaryDefinition = $baseDictionary === null ? null : $baseDictionary->definition;
+                $dictionaryTransliteration = $dictionary === null ? null : $dictionary->transliteration;
+                $baseDictionaryTransliteration = $baseDictionary === null ? null : $baseDictionary->transliteration;
 
                 return [
                     'lexical_id' => (string) ($parse['lemma'] ?? $parse['baseStrongs']),
                     'strongs_number' => $strongs,
-                    'headword' => $fallback['hebrew'] ?? $sourceHeadword,
-                    'source_root' => $sourceHeadword,
+                    'base_strongs_number' => $baseStrongs,
+                    'headword' => $fallback['hebrew'] ?? $dictionaryHeadword ?? $baseDictionaryHeadword ?? $sourceHeadword,
+                    'dictionary_match' => $dictionaryMatch,
                     'morphology' => $parse['morphology'] ?? null,
                     'morphology_description' => $parse['morphologyDescription'] ?? null,
-                    'definition' => $fallback['definition'] ?? $parse['definition'] ?? null,
+                    'definition' => $dictionaryDefinition
+                        ?? $fallback['definition']
+                        ?? $baseDictionaryDefinition
+                        ?? $this->validDefinition($parse['definition'] ?? null),
+                    'dictionary_transliteration' => $dictionaryTransliteration ?? $baseDictionaryTransliteration,
+                    'occurrences' => array_values(array_filter(
+                        is_array($parse['occurrences'] ?? null) ? $parse['occurrences'] : [],
+                        fn (mixed $reference): bool => is_string($reference) && trim($reference) !== '',
+                    )),
                 ];
             })->values();
 
-        $enrichment = $word->enrichment ?? [];
         $enrichment['lemma']['candidates'] = $candidates->all();
-        $enrichment['lemma']['source'] = ($payload['_error'] ?? null) === 'source-unavailable'
-            ? 'morphology-source-unavailable'
-            : 'brithamashiach-morphology';
+        $enrichment['lemma']['source'] = 'brithamashiach-morphology';
         $enrichment['lemma']['source_surface_form'] = $payload['surfaceForm'] ?? null;
         $enrichment['lemma']['source_surface_form_with_breaks'] = $payload['surfaceFormWithBreaks'] ?? null;
 
@@ -340,16 +404,22 @@ class ScriptureImporter
 
         $strongsNumbers = $candidates->pluck('strongs_number')->filter()->unique()->values();
         $selected = null;
+        $selectionIsProposed = ($payload['_force_proposed'] ?? false) === true;
         if ($strongsNumbers->count() === 1) {
             $selected = $candidates->firstWhere('strongs_number', $strongsNumbers->first());
+        } elseif (($preferred = $this->preferredStrongs($word, array_values($candidates->all()))) !== null) {
+            $selected = $candidates->firstWhere('strongs_number', $preferred);
         } elseif ($word->lemma !== null && $strongsNumbers->contains($word->lemma->strongs_number)) {
             $selected = $candidates->firstWhere('strongs_number', $word->lemma->strongs_number);
-        } elseif (($preferred = $this->preferredStrongs($word, $candidates->values()->all())) !== null) {
-            $selected = $candidates->firstWhere('strongs_number', $preferred);
         }
 
         if (! is_array($selected) || blank($selected['headword'] ?? null)) {
-            $enrichment['lemma']['status'] = $candidates->count() > 1 ? 'proposed' : 'unresolved';
+            $selected = $candidates->first(fn (array $candidate): bool => filled($candidate['headword'] ?? null));
+            $selectionIsProposed = is_array($selected);
+        }
+
+        if (! is_array($selected) || blank($selected['headword'] ?? null)) {
+            $enrichment['lemma']['status'] = 'unresolved';
             $word->update(['enrichment' => $enrichment]);
 
             return false;
@@ -360,19 +430,26 @@ class ScriptureImporter
         $sourceUrl = rtrim((string) config('services.brit_hamashiach.url'), '/')
             .'/api/volume/morphology/'.rawurlencode($this->tokenizer->lookupForm($word->hebrew));
 
-        return DB::transaction(function () use ($word, $candidates, $selected, $strongs, $hebrew, $sourceUrl, $enrichment): bool {
+        return DB::transaction(function () use ($word, $candidates, $selected, $selectionIsProposed, $strongs, $hebrew, $sourceUrl, $enrichment): bool {
             $lemma = Lemma::query()->firstOrCreate(
                 ['strongs_number' => $strongs],
-                ['hebrew' => $hebrew, 'normalized' => $this->tokenizer->normalize($hebrew)],
+                [
+                    'hebrew' => $hebrew,
+                    'normalized' => $this->tokenizer->normalize($hebrew),
+                    'base_strongs_number' => $selected['base_strongs_number'],
+                    'source_lexical_id' => $selected['lexical_id'],
+                ],
             );
             if (in_array($lemma->hebrew, ['', 'N/A'], true) || $lemma->normalized === '') {
                 $lemma->hebrew = $hebrew;
                 $lemma->normalized = $this->tokenizer->normalize($hebrew);
             }
             foreach ([
-                'transliteration' => data_get($this->strongsFallback($strongs), 'transliteration'),
+                'base_strongs_number' => $selected['base_strongs_number'],
+                'source_lexical_id' => $selected['lexical_id'],
+                'transliteration' => $selected['dictionary_transliteration']
+                    ?? data_get($this->strongsFallback($strongs), 'transliteration'),
                 'definition' => $selected['definition'] ?? null,
-                'root' => $selected['source_root'] ?? null,
                 'source_reference' => $sourceUrl,
             ] as $field => $value) {
                 if (blank($lemma->{$field}) && filled($value)) {
@@ -400,12 +477,19 @@ class ScriptureImporter
             }
 
             $enrichment['lemma'] = array_merge($enrichment['lemma'], [
-                'status' => 'confirmed',
+                'status' => $selectionIsProposed ? 'proposed' : 'confirmed',
                 'lexical_id' => $selected['lexical_id'],
                 'strongs_number' => $strongs,
-                'headword_source' => $this->strongsFallback($strongs) !== null ? 'verified-fallback' : 'source-root-field',
+                'base_strongs_number' => $selected['base_strongs_number'],
+                'dictionary_match' => $selected['dictionary_match'],
+                'headword_source' => $this->strongsFallback($strongs) !== null
+                    ? 'verified-fallback'
+                    : ($selected['dictionary_match'] !== null ? 'stepbible-tbesh' : 'source-headword-field'),
             ]);
             $word->update(['lemma_id' => $lemma->id, 'morphology' => array_filter($morphology, fn ($value) => $value !== null), 'enrichment' => $enrichment]);
+            if (! $selectionIsProposed) {
+                $this->syncBiblicalReferences($lemma, $selected['occurrences'], $sourceUrl);
+            }
 
             return true;
         });
@@ -419,6 +503,15 @@ class ScriptureImporter
         }
 
         return $strongs;
+    }
+
+    private function baseStrongs(string $strongs): string
+    {
+        if (preg_match('/^H?(\d+)/i', trim($strongs), $matches) === 1) {
+            return 'H'.ltrim($matches[1], '0');
+        }
+
+        return trim($strongs);
     }
 
     /**
@@ -494,9 +587,73 @@ class ScriptureImporter
         return is_array($fallback) ? $fallback : null;
     }
 
+    private function dictionaryLemma(string $strongs): ?Lemma
+    {
+        return Lemma::query()->where('strongs_number', $strongs)->first();
+    }
+
     private function validHeadword(mixed $value): ?string
     {
         return is_string($value) && $value !== '' && strtoupper($value) !== 'N/A' ? $value : null;
+    }
+
+    private function validDefinition(mixed $value): ?string
+    {
+        return is_string($value) && $value !== '' && strtoupper($value) !== 'N/A' ? $value : null;
+    }
+
+    /** @param list<string> $references */
+    private function syncBiblicalReferences(Lemma $lemma, array $references, string $sourceUrl): void
+    {
+        foreach ($references as $position => $rawReference) {
+            $normalized = $this->normalizeBiblicalReference($rawReference);
+            BiblicalReference::query()->updateOrCreate(
+                [
+                    'lemma_id' => $lemma->id,
+                    'source' => 'Brit HaMashiach morphology',
+                    'source_position' => $position + 1,
+                ],
+                [
+                    'raw_reference' => $rawReference,
+                    'normalized_reference' => $normalized['normalized_reference'],
+                    'book' => $normalized['book'],
+                    'chapter' => null,
+                    'verse' => null,
+                    'source_url' => $sourceUrl,
+                ],
+            );
+        }
+
+        BiblicalReference::query()
+            ->where('lemma_id', $lemma->id)
+            ->where('source', 'Brit HaMashiach morphology')
+            ->where('source_position', '>', count($references))
+            ->delete();
+    }
+
+    /** @return array{normalized_reference: string, book: string|null} */
+    private function normalizeBiblicalReference(string $rawReference): array
+    {
+        $abbreviation = explode('.', $rawReference, 2)[0];
+        $books = [
+            'Gen' => 'Genesis', 'Exod' => 'Exodus', 'Lev' => 'Leviticus', 'Num' => 'Numbers',
+            'Deut' => 'Deuteronomy', 'Josh' => 'Joshua', 'Judg' => 'Judges', 'Ruth' => 'Ruth',
+            '1Sam' => '1 Samuel', '2Sam' => '2 Samuel', '1Kgs' => '1 Kings', '2Kgs' => '2 Kings',
+            '1Chr' => '1 Chronicles', '2Chr' => '2 Chronicles', 'Ezra' => 'Ezra', 'Neh' => 'Nehemiah',
+            'Esth' => 'Esther', 'Job' => 'Job', 'Ps' => 'Psalms', 'Prov' => 'Proverbs',
+            'Eccl' => 'Ecclesiastes', 'Song' => 'Song of Songs', 'Isa' => 'Isaiah', 'Jer' => 'Jeremiah',
+            'Lam' => 'Lamentations', 'Ezek' => 'Ezekiel', 'Dan' => 'Daniel', 'Hos' => 'Hosea',
+            'Joel' => 'Joel', 'Amos' => 'Amos', 'Obad' => 'Obadiah', 'Jonah' => 'Jonah',
+            'Mic' => 'Micah', 'Nah' => 'Nahum', 'Hab' => 'Habakkuk', 'Zeph' => 'Zephaniah',
+            'Hag' => 'Haggai', 'Zech' => 'Zechariah', 'Mal' => 'Malachi',
+        ];
+
+        return [
+            // The endpoint's numeric component is intentionally left opaque:
+            // values such as 1Chr.41 cannot be a canonical chapter reference.
+            'normalized_reference' => $rawReference,
+            'book' => $books[$abbreviation] ?? null,
+        ];
     }
 
     /** @return array<string, mixed> */

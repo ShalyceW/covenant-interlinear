@@ -3,7 +3,7 @@ import InterlinearPassage from '@/components/InterlinearPassage.vue';
 import PublicShell from '@/components/PublicShell.vue';
 import WordStudyPanel from '@/components/WordStudyPanel.vue';
 import { Head, router } from '@inertiajs/vue3';
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 
 const props = defineProps<{
     book: any;
@@ -16,6 +16,14 @@ const showGlosses = ref(true);
 const showEnglish = ref(true);
 const scale = ref(1);
 const selectedWord = ref<number | null>(null);
+onMounted(() => {
+    const requestedWord = Number(
+        new URLSearchParams(window.location.search).get('word'),
+    );
+    if (Number.isInteger(requestedWord) && requestedWord > 0) {
+        selectedWord.value = requestedWord;
+    }
+});
 const previous = computed(
     () =>
         props.chapters[
